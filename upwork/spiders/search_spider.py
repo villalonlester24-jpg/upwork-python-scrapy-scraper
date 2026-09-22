@@ -33,13 +33,14 @@ class UpworkSearchSpider(scrapy.Spider):
     }
 
     def __init__(self, search_params=DEFAULT_SEARCH_PARAMS, query=None, limit=50,
-                 mode=None, days_posted=None, *args, **kwargs):
+                 mode=None, days_posted=None, max_attempts=3, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.search_params_path = search_params
         self.query_override = query
         self.limit_override = int(limit) if limit else None
         self.mode_override = mode
         self.days_posted = int(days_posted) if days_posted is not None else None
+        self.max_attempts = max(1, int(max_attempts))
         self.seen_jobs = set()
         self.item_count = 0
 
@@ -96,53 +97,72 @@ class UpworkSearchSpider(scrapy.Spider):
 
     def parse_search(self, response):
         cards = response.css('article.job-tile')
-        if not cards:
-            if not response.meta.get('retried'):
-                self.logger.warning("No job cards on page %s; retrying with full "
-                                    "render.", response.meta['page'])
-                meta = dict(response.meta)
-                meta['retried'] = True
-                meta['zenrows_mode'] = ''  # force js_render + premium_proxy
-                yield self._request(response.meta['search_url'], self.parse_search, meta)
-            else:
-                self.logger.error("No job cards after retry: %s",
-                                  response.meta.get('search_url'))
+        rows = [self._parse_card(card, response.meta['page']) for card in cards]
+        good_titles = sum(1 for row in rows if row['title'] and row['job_id'])
+
+        # A partially-rendered page can return cards with empty titles. Treat
+        # that as a failure and retry with a longer wait instead of saving junk.
+        if not rows or good_titles == 0:
+            reason = 'no cards' if not rows else 'empty titles'
+            retry = self._retry_search(response, reason)
+            if retry is not None:
+                yield retry
             return
 
-        self.logger.info("Page %s: %s cards.", response.meta['page'], len(cards))
+        self.logger.info("Page %s: %s cards (%s with titles).",
+                         response.meta['page'], len(rows), good_titles)
         max_jobs = response.meta.get('limit', 0)
-        for card in cards:
+        for row in rows:
+            if not row['job_id'] or not row['title']:
+                continue
             if max_jobs and self.item_count >= max_jobs:
                 break
-            uid = card.attrib.get('data-ev-job-uid')
-            if uid in self.seen_jobs:
+            if row['job_id'] in self.seen_jobs:
                 continue
-            self.seen_jobs.add(uid)
+            self.seen_jobs.add(row['job_id'])
             self.item_count += 1
+            yield row
 
-            duration = self._text(card, '[data-test="duration-label"]')
-            est_time, hours_per_week = self._split_duration(duration)
-            skills = [
-                text for text in (
-                    self._text(token, '') for token in card.css('[data-test="token"]')
-                ) if text
-            ]
+    def _parse_card(self, card, page):
+        uid = card.attrib.get('data-ev-job-uid')
+        duration = self._text(card, '[data-test="duration-label"]')
+        est_time, hours_per_week = self._split_duration(duration)
+        skills = [
+            text for text in (
+                self._text(token, '') for token in card.css('[data-test="token"]')
+            ) if text
+        ]
+        return {
+            'title': self._text(card, '[data-test="job-tile-title-link"]'),
+            'url': f"https://www.upwork.com/jobs/~02{uid}" if uid else '',
+            'job_id': uid,
+            'posted': self._text(card, '[data-test*="job-pub"]'),
+            'job_type': self._text(card, '[data-test="job-type-label"]'),
+            'experience_level': self._text(card, '[data-test="experience-level"]'),
+            'duration': duration,
+            'est_time': est_time,
+            'hours_per_week': hours_per_week,
+            'description': (self._text(card, 'p.rr-mask')
+                            or self._text(card, '.air3-line-clamp-wrapper p')),
+            'skills': skills,
+            'search_page': page,
+        }
 
-            yield {
-                'title': self._text(card, '[data-test="job-tile-title-link"]'),
-                'url': f"https://www.upwork.com/jobs/~02{uid}" if uid else '',
-                'job_id': uid,
-                'posted': self._text(card, '[data-test*="job-pub"]'),
-                'job_type': self._text(card, '[data-test="job-type-label"]'),
-                'experience_level': self._text(card, '[data-test="experience-level"]'),
-                'duration': duration,
-                'est_time': est_time,
-                'hours_per_week': hours_per_week,
-                'description': (self._text(card, 'p.rr-mask')
-                                or self._text(card, '.air3-line-clamp-wrapper p')),
-                'skills': skills,
-                'search_page': response.meta['page'],
-            }
+    def _retry_search(self, response, reason):
+        """Schedule a longer-wait retry when a page rendered incompletely."""
+        attempt = response.meta.get('attempt', 1)
+        if attempt >= self.max_attempts:
+            self.logger.error("Page %s still incomplete after %s attempt(s): %s",
+                              response.meta.get('page'), attempt, reason)
+            return None
+        meta = dict(response.meta)
+        meta['attempt'] = attempt + 1
+        meta['zenrows_mode'] = ''       # force js_render + premium_proxy
+        meta['zenrows_wait'] = '9000'   # give the JS results list more time
+        self.logger.warning("Page %s rendered incompletely (%s); retrying %s/%s "
+                            "with a longer wait.", response.meta.get('page'),
+                            reason, attempt, self.max_attempts)
+        return self._request(response.meta['search_url'], self.parse_search, meta)
 
     def _apply_days_posted(self, params):
         """0 = any time (drop the filter); N>0 = last N days."""

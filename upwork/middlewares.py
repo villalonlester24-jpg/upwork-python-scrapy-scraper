@@ -28,6 +28,7 @@ class ZenRowsMiddleware:
 
     def _get_zenrows_url(self, request):
         mode = request.meta.get('zenrows_mode', self.mode)
+        wait = request.meta.get('zenrows_wait', self.wait)
         payload = {'apikey': self.api_key, 'url': request.url}
         if mode:
             payload['mode'] = mode
@@ -36,8 +37,8 @@ class ZenRowsMiddleware:
                 payload['js_render'] = 'true'
             if self.premium_proxy:
                 payload['premium_proxy'] = 'true'
-            if self.js_render and self.wait:
-                payload['wait'] = str(self.wait)
+            if self.js_render and wait:
+                payload['wait'] = str(wait)
         if self.proxy_country:
             payload['proxy_country'] = self.proxy_country
         return self.endpoint + urlencode(payload)
